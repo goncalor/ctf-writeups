@@ -339,4 +339,119 @@ kiosk> Acknowledged household:
 
 == What do we XOR with?
 
+This took me a while to figure out.
+I checked whether the program at some point set RDI and RSI to values that could be used when calling `give_flag()`.
+Above it, there's this `admin_audit`:
 
+----
+[0x004017b5]> pd 10
+            ;-- admin_audit:
+            ; DATA XREF from main @ 0x40193b(r)
+            0x004017b5      5f             pop rdi
+            0x004017b6      c3             ret
+            0x004017b7      5e             pop rsi
+            0x004017b8      c3             ret
+┌ 257: sym.give_flag (int64_t arg1, int64_t arg2); // noreturn
+│ `- args(rdi, rsi) vars(12:sp[0xc..0x78])
+│           0x004017b9      55             push rbp
+│           0x004017ba      4889e5         mov rbp, rsp
+│           0x004017bd      4883ec70       sub rsp, 0x70
+----
+
+It pops RDI and RSI from the stack, just before the `give_flag()` instructions.
+This seemed it to me.
+But this means we must have on the stack the values we want to XOR with...
+Where are they?
+
+I could have figured this out from the challenge's context, which mentions the two arguments to the flag function are stored as globals.
+So... it should be in the `.data` section or `.rodata`.
+
+I didn't figure this out so I had to do it in another way.
+
+=== Searching for the XOR key
+
+We know that the flag must start with `SDG{`.
+We also know `flag_ct`.
+So we can XOR both to obtain the start of the XOR key.
+
+----
+[0x004017b5]> pcp 100 @ obj.flag_ct
+import struct
+buf = struct.pack ("100B", *[
+0x17,0x55,0x3c,0x0f,0x20,0x8c,0x16,0xf1,0x58,0xbe,0x90,
+0x18,0x73,0x31,0xc1,0x68,0x27,0x74,0x19,0x4d,0x20,0x89,
+0x44,0xf3,0x0f,0xbc,0xcb,0x1e,0x23,0x6c,0x92,0x6d,0x27,
+0x25,0x4b,0x45,0x3e,0xbe,0x22,0x92,0x39,0x8a,0xf2,0x2e,
+0x17,0x09,0xa3,0x5b,0x6b,0x69,0x6f,0x73,0x6b,0x3e,0x20,
+0x00,0x41,0x63,0x6b,0x6e,0x6f,0x77,0x6c,0x65,0x64,0x67,
+0x65,0x64,0x20,0x68,0x6f,0x75,0x73,0x65,0x68,0x6f,0x6c,
+0x64,0x3a,0x20,0x25,0x73,0x0a,0x00,0x75,0x6e,0x72,0x65,
+0x61,0x63,0x68,0x61,0x62,0x6c,0x65,0x00,0xec,0x3a,0xf8,
+0xff])
+
+$ python
+>>> buf
+b'\x17U<\x0f \x8c\x16\xf1X\xbe\x90\x18s1\xc1h\'t\x19M \x89D\xf3\x0f\xbc\xcb\x1e#l\x92m\'%KE>\xbe"\x929\x8a\xf2.\x17\t\xa3[kiosk> \x00Acknowledged household: %s\n\x00unreachable\x00\xec:\xf8\xff'
+
+>>> from pwnlib.util.fiddling import *
+>>> enhex(xor(buf, b"SDG{")[0:4])
+'44117b74'
+----
+
+So we know that the XOR key starts with 0x44117b74.
+Now I wanted to search it in all memory sections.
+GDB doesn't offer a way to do this, so I wrote one:
+
+----
+include::gdb-findall.py[]
+----
+
+It lists the mapped sections (`info proc map`) and then uses `find` a value over each of them.
+Let's run it to find 0x44117b74.
+But not so fast...
+Let's not forget endianness, the value should be stored in memory as 0x747b1144.
+
+----
+$ gdb -q Ration_Kiosk
+Reading symbols from Ration_Kiosk...
+(gdb) b main
+Breakpoint 1 at 0x40193b
+(gdb) r
+Starting program: Ration_Kiosk 
+
+Breakpoint 1, 0x000000000040193b in main ()
+(gdb) so gdb-findall.py 
+(gdb) findall 0x747b1144
+find 4194304, 4198400, 0x747b1144
+Pattern not found.
+
+find 4198400, 4710400, 0x747b1144
+Pattern not found.
+
+find 4710400, 4874240, 0x747b1144
+Pattern not found.
+
+find 4874240, 4890624, 0x747b1144
+Pattern not found.
+
+find 4890624, 4902912, 0x747b1144
+0x4aa0e0 <subsidy_alpha>
+1 pattern found.
+
+find 4902912, 4923392, 0x747b1144
+Pattern not found.
+----
+
+There it is!
+There's a `subsidy_alpha` symbol that's in the `.data` section:
+
+----
+maintenance info sections
+Exec file: `Ration_Kiosk', file type elf64-x86-64
+...
+ [18]     0x004aa0c0->0x004abbf8 at 0x000aa0c0: .data ALLOC LOAD DATA HAS_CONTENTS
+...
+----
+
+Okay then...
+Let's look at the `.data` section in Radare2.
