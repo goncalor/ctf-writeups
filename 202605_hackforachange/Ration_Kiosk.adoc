@@ -292,8 +292,8 @@ Main observations:
 
 * Receives two arguments, in RDI and RSI
 * Progressively loads bytes from `obj.flag_ct`, which I assume means "flag ciphertext" (!!)
-* XORs the `flag_ct` bytes with those from the function arguments and stores the results to memory
-* Prints that result to stdout
+* XORs the `flag_ct` bytes with 16 bytes from the function arguments and stores the results to memory
+* Prints the result to stdout
 
 So... We want to call this function so that it decrypts an prints the flag.
 
@@ -334,7 +334,7 @@ kiosk> Acknowledged household:
 ----
 
 * The program no longer segfaults
-* But it prints some gibberish, not the flag
+* But it prints some gibberish, not a flag
 ** This is natural... because we XORed `flag_ct` with unspecified RDI and RSI arguments
 
 == What do we XOR with?
@@ -454,4 +454,27 @@ Exec file: `Ration_Kiosk', file type elf64-x86-64
 ----
 
 Okay then...
-Let's look at the `.data` section in Radare2.
+Let's look at `subsidy_alpha` in Radare2.
+
+----
+[0x004017b5]> f~subsi
+0x004aa0e0 8 obj.subsidy_alpha
+0x004aa200 8 obj.subsidy_beta
+
+[0x004017b5]> s obj.subsidy_alpha
+[0x004aa0e0]> pxq
+0x004aa0e0  0x9222be43747b1144  0x0000000000000000   D.{tC.".........
+0x004aa0f0  0x0000000000000000  0x0000000000000000   ................
+0x004aa100  0x444c4e4f49544152  0x21524c4c49465247   RATIONLDGRFILLR!
+
+[0x004aa0e0]> s obj.subsidy_beta
+[0x004aa200]> pxq
+0x004aa200  0x5ba309172ef28a39  0x0000000000000800   9......[........
+0x004aa210  0x0000000000000800  0x0000000000100000   ................
+----
+
+So `subsidy_alpha` is a 8-byte variable.
+And there's also a 8-byte `subsidy_beta`, which seems suspicious.
+My bet was then that these two together were the XOR key.
+
+Next, let's test that theory.
