@@ -402,11 +402,13 @@ So we know that the XOR key starts with 0x44117b74.
 Now I wanted to search it in all memory sections.
 GDB doesn't offer a way to do this, so I wrote one:
 
+.gdb-findall.py
 ----
 include::gdb-findall.py[]
 ----
 
-It lists the mapped sections (`info proc map`) and then uses `find` a value over each of them.
+It lists the mapped sections (`info proc map`) and then ``find``s a value over each of them.
+
 Let's run it to find 0x44117b74.
 But not so fast...
 Let's not forget endianness, the value should be stored in memory as 0x747b1144.
@@ -420,6 +422,7 @@ Breakpoint 1 at 0x40193b
 Starting program: Ration_Kiosk 
 
 Breakpoint 1, 0x000000000040193b in main ()
+
 (gdb) so gdb-findall.py 
 (gdb) findall 0x747b1144
 find 4194304, 4198400, 0x747b1144
@@ -453,8 +456,7 @@ Exec file: `Ration_Kiosk', file type elf64-x86-64
 ...
 ----
 
-Okay then...
-Let's look at `subsidy_alpha` in Radare2.
+Okay then... Let's look at `subsidy_alpha` in Radare2.
 
 ----
 [0x004017b5]> f~subsi
@@ -475,7 +477,7 @@ Let's look at `subsidy_alpha` in Radare2.
 
 So `subsidy_alpha` is a 8-byte variable.
 And there's also a 8-byte `subsidy_beta`, which seems suspicious.
-My bet was then that these two together were the XOR key.
+My bet was then that these two together were the 16-byte XOR key.
 
 Next, let's test that theory.
 
@@ -512,7 +514,7 @@ So our plan will be:
 . Use the following RET to jump to `give_flag()`
 . Let `give_flag()` do its XOR magic and hopefully print the flag
 
-To do this, we want the stack to look as follows when `handle_request()` returns:
+To do this, we want the stack to look as follows just before `handle_request()` returns:
 
 ----
 |                    |                  
